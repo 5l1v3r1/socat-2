@@ -64,7 +64,7 @@ const struct addrdesc addr_openssl = {
    3,		/* data flow directions this address supports on API layer:
 		   1..read, 2..write, 3..both */
    xioopen_openssl_connect,	/* a function pointer used to "open" these addresses.*/
-   GROUP_FD|GROUP_SOCKET|GROUP_SOCK_IP4|GROUP_SOCK_IP6|GROUP_IP_TCP|GROUP_CHILD|GROUP_OPENSSL|GROUP_RETRY,	/* bitwise OR of address groups this address belongs to.
+   GROUP_FD|GROUP_SOCKET|GROUP_SOCK_IP4|GROUP_SOCK_IP6|GROUP_IP_TCP|GROUP_IP_UDP|GROUP_CHILD|GROUP_OPENSSL|GROUP_RETRY,	/* bitwise OR of address groups this address belongs to.
 		   You might have to specify a new group in xioopts.h */
    0,		/* an integer passed to xioopen_openssl; makes it possible to
 		   use the same xioopen_openssl function for slightly different
@@ -85,7 +85,7 @@ const struct addrdesc addr_openssl_listen = {
    3,		/* data flow directions this address supports on API layer:
 		   1..read, 2..write, 3..both */
    xioopen_openssl_listen,	/* a function pointer used to "open" these addresses.*/
-   GROUP_FD|GROUP_SOCKET|GROUP_SOCK_IP4|GROUP_SOCK_IP6|GROUP_IP_TCP|GROUP_LISTEN|GROUP_CHILD|GROUP_RANGE|GROUP_OPENSSL|GROUP_RETRY,	/* bitwise OR of address groups this address belongs to.
+   GROUP_FD|GROUP_SOCKET|GROUP_SOCK_IP4|GROUP_SOCK_IP6|GROUP_IP_TCP|GROUP_IP_UDP|GROUP_LISTEN|GROUP_CHILD|GROUP_RANGE|GROUP_OPENSSL|GROUP_RETRY,	/* bitwise OR of address groups this address belongs to.
 		   You might have to specify a new group in xioopts.h */
    0,		/* an integer passed to xioopen_openssl_listen; makes it possible to
 		   use the same xioopen_openssl_listen function for slightly different
@@ -117,6 +117,7 @@ const struct optdesc opt_openssl_compress    = { "openssl-compress",   "compress
 const struct optdesc opt_openssl_fips        = { "openssl-fips",       "fips",   OPT_OPENSSL_FIPS,        GROUP_OPENSSL, PH_SPEC, TYPE_BOOL,     OFUNC_SPEC };
 #endif
 const struct optdesc opt_openssl_commonname  = { "openssl-commonname", "cn",     OPT_OPENSSL_COMMONNAME,  GROUP_OPENSSL, PH_SPEC, TYPE_STRING,   OFUNC_SPEC };
+const struct optdesc opt_openssl_udp         = { "openssl-udp",        "udp",    OPT_OPENSSL_UDP,         GROUP_OPENSSL, PH_SPEC, TYPE_BOOL,     OFUNC_SPEC };
 
 
 /* If FIPS is compiled in, we need to track if the user asked for FIPS mode.
@@ -197,6 +198,7 @@ static int
    bool opt_ver = true;	/* verify peer certificate */
    char *opt_cert = NULL;	/* file name of client certificate */
    const char *opt_commonname = NULL;	/* for checking peer certificate */
+   bool opt_udp = false; /* use UDP */
    int result;
 
    if (!(xioflags & XIO_MAYCONVERT)) {
@@ -234,6 +236,12 @@ static int
    result =
       _xioopen_openssl_prepare(opts, xfd, false, &opt_ver, opt_cert, &ctx);
    if (result != STAT_OK)  return STAT_NORETRY;
+
+   retropt_bool(opts, OPT_OPENSSL_UDP, &opt_udp);
+   if (opt_udp) {
+      ipproto = IPPROTO_UDP;
+      socktype = SOCK_DGRAM;
+   }
 
    result =
       _xioopen_ipapp_prepare(opts, &opts0, hostname, portname, &pf, ipproto,
@@ -402,6 +410,194 @@ int _xioopen_openssl_connect(struct single *xfd,
 
 
 #if WITH_LISTEN
+static int _xioopen_listen_udp(struct single *xfd, int xioflags, struct sockaddr *us, socklen_t uslen,
+                               struct opt *opts, int pf, int socktype, int proto, int level) {
+   char *rangename;
+   bool dofork = false;
+   int maxchildren = 0;
+   char infobuff[256];
+   int result;
+   union sockaddr_union themunion;
+   union sockaddr_union *them = &themunion;
+   socklen_t themlen;
+   unsigned char buff1[1];
+
+   retropt_bool(opts, OPT_FORK, &dofork);
+
+   if (dofork) {
+      if (!(xioflags & XIO_MAYFORK)) {
+         Error("option fork not allowed here");
+         return STAT_NORETRY;
+      }
+   }
+
+   retropt_int(opts, OPT_MAX_CHILDREN, &maxchildren);
+
+   if (! dofork && maxchildren) {
+      Error("option max-children not allowed without option fork");
+      return STAT_NORETRY;
+   }
+
+#if WITH_IP4 /*|| WITH_IP6*/
+   if (retropt_string(opts, OPT_RANGE, &rangename) >= 0) {
+      if (xioparserange(rangename, pf, &xfd->para.socket.range) < 0) {
+         free(rangename);
+         return STAT_NORETRY;
+      }
+      free(rangename);
+      xfd->para.socket.dorange = true;
+   }
+#endif
+
+#if WITH_LIBWRAP
+   xio_retropt_tcpwrap(xfd, opts);
+#endif /* WITH_LIBWRAP */
+
+   if (retropt_ushort(opts, OPT_SOURCEPORT, &xfd->para.socket.ip.sourceport)
+       >= 0) {
+      xfd->para.socket.ip.dosourceport = true;
+   }
+   retropt_bool(opts, OPT_LOWPORT, &xfd->para.socket.ip.lowport);
+
+   if (dofork) {
+      xiosetchilddied();	/* set SIGCHLD handler */
+   }
+
+   while (true) {	/* we loop with fork or prohibited packets */
+      /* now wait for some packet on this datagram socket, get its sender
+         address, connect there, and return */
+      int reuseaddr = dofork;
+      int doreuseaddr = (dofork != 0);
+      char infobuff[256];
+      union sockaddr_union _sockname;
+      union sockaddr_union *la = &_sockname;	/* local address */
+      struct pollfd readfd;
+
+      if ((xfd->fd = xiosocket(opts, pf, socktype, IPPROTO_UDP, E_ERROR)) < 0) {
+         return STAT_RETRYLATER;
+      }
+      doreuseaddr |= (retropt_int(opts, OPT_SO_REUSEADDR, &reuseaddr) >= 0);
+      applyopts(xfd->fd, opts, PH_PASTSOCKET);
+      if (doreuseaddr) {
+         if (Setsockopt(xfd->fd, opt_so_reuseaddr.major,
+                        opt_so_reuseaddr.minor, &reuseaddr, sizeof(reuseaddr))
+             < 0) {
+            Warn6("setsockopt(%d, %d, %d, {%d}, "F_Zd"): %s",
+                  xfd->fd, opt_so_reuseaddr.major,
+                  opt_so_reuseaddr.minor, reuseaddr, sizeof(reuseaddr),
+                  strerror(errno));
+         }
+      }
+      applyopts_cloexec(xfd->fd, opts);
+      applyopts(xfd->fd, opts, PH_PREBIND);
+      applyopts(xfd->fd, opts, PH_BIND);
+      if (Bind(xfd->fd, us, uslen) < 0) {
+         Error4("bind(%d, {%s}, "F_socklen"): %s", xfd->fd,
+                sockaddr_info(us, uslen, infobuff, sizeof(infobuff)),
+                uslen, strerror(errno));
+         return STAT_RETRYLATER;
+      }
+      /* under some circumstances bind() fills sockaddr with interesting info. */
+      if (Getsockname(xfd->fd, us, &uslen) < 0) {
+         Error4("getsockname(%d, %p, {%d}): %s",
+                xfd->fd, &us, uslen, strerror(errno));
+      }
+      applyopts(xfd->fd, opts, PH_PASTBIND);
+
+      Notice1("listening on UDP %s",
+              sockaddr_info(us, uslen, infobuff, sizeof(infobuff)));
+      readfd.fd = xfd->fd;
+      readfd.events = POLLIN|POLLERR;
+      while (xiopoll(&readfd, 1, NULL) < 0) {
+         if (errno != EINTR)  break;
+      }
+
+      themlen = socket_init(pf, them);
+      do {
+         result = Recvfrom(xfd->fd, buff1, 1, MSG_PEEK,
+                           &them->soa, &themlen);
+      } while (result < 0 && errno == EINTR);
+      if (result < 0) {
+         Error5("recvfrom(%d, %p, 1, MSG_PEEK, {%s}, {"F_socklen"}): %s",
+                xfd->fd, buff1,
+                sockaddr_info(&them->soa, themlen, infobuff, sizeof(infobuff)),
+                themlen, strerror(errno));
+         return STAT_RETRYLATER;
+      }
+
+      Notice1("accepting UDP connection from %s",
+              sockaddr_info(&them->soa, themlen, infobuff, sizeof(infobuff)));
+
+      if (xiocheckpeer(xfd, them, la) < 0) {
+         /* drop packet */
+         char buff[512];
+         Recv(xfd->fd, buff, sizeof(buff), 0);	/* drop packet */
+         Close(xfd->fd);
+         continue;
+      }
+      Info1("permitting UDP connection from %s",
+            sockaddr_info(&them->soa, themlen, infobuff, sizeof(infobuff)));
+
+      if (dofork) {
+         pid_t pid;
+
+         pid = xio_fork(false, E_ERROR);
+         if (pid < 0) {
+            return STAT_RETRYLATER;
+         }
+
+         if (pid == 0) {	/* child */
+            pid_t cpid = Getpid();
+            xiosetenvulong("PID", cpid, 1);
+            break;
+         }
+
+         /* server: continue loop with socket()+recvfrom() */
+         /* when we dont close this we get awkward behaviour on Linux 2.4:
+            recvfrom gives 0 bytes with invalid socket address */
+         if (Close(xfd->fd) < 0) {
+            Info2("close(%d): %s", xfd->fd, strerror(errno));
+         }
+
+         while (maxchildren) {
+            if (num_child < maxchildren) break;
+            Notice("maxchildren are active, waiting");
+            /* UINT_MAX would even be nicer, but Openindiana works only
+               with 31 bits */
+            while (!Sleep(INT_MAX)) ;	/* any signal lets us continue */
+         }
+         Info("still listening");
+         continue;
+      }
+      break;
+   }
+
+   applyopts(xfd->fd, opts, PH_CONNECT);
+   if ((result = Connect(xfd->fd, &them->soa, themlen)) < 0) {
+      Error4("connect(%d, {%s}, "F_socklen"): %s",
+             xfd->fd,
+             sockaddr_info(&them->soa, themlen, infobuff, sizeof(infobuff)),
+             themlen, strerror(errno));
+      return STAT_RETRYLATER;
+   }
+
+   /* set the env vars describing the local and remote sockets */
+   if (Getsockname(xfd->fd, us, &uslen) < 0) {
+      Warn4("getsockname(%d, %p, {%d}): %s",
+            xfd->fd, us, uslen, strerror(errno));
+   }
+   xiosetsockaddrenv("SOCK", (union sockaddr_union *)us,  uslen,   IPPROTO_UDP);
+   xiosetsockaddrenv("PEER", them, themlen, IPPROTO_UDP);
+
+   xfd->howtoend = END_SHUTDOWN;
+   applyopts_fchown(xfd->fd, opts);
+   applyopts(xfd->fd, opts, PH_LATE);
+
+   if ((result = _xio_openlate(xfd, opts)) < 0)
+      return result;
+
+   return 0;
+}
 
 static int
    xioopen_openssl_listen(int argc,
@@ -433,6 +629,7 @@ static int
    bool opt_ver = true;	/* verify peer certificate - changed with 1.6.0 */
    char *opt_cert = NULL;	/* file name of server certificate */
    const char *opt_commonname = NULL;	/* for checking peer certificate */
+   bool opt_udp = false; /* use UDP */
    int result;
 
    if (!(xioflags & XIO_MAYCONVERT)) {
@@ -473,6 +670,12 @@ static int
       _xioopen_openssl_prepare(opts, xfd, true, &opt_ver, opt_cert, &ctx);
    if (result != STAT_OK)  return STAT_NORETRY;
 
+   retropt_bool(opts, OPT_OPENSSL_UDP, &opt_udp);
+   if (opt_udp) {
+      ipproto = IPPROTO_UDP;
+      socktype = SOCK_DGRAM;
+   }
+
    if (_xioopen_ipapp_listen_prepare(opts, &opts0, portname, &pf, ipproto,
 				     xfd->para.socket.ip.res_opts[1],
 				     xfd->para.socket.ip.res_opts[0],
@@ -493,6 +696,7 @@ static int
 #endif /* WITH_RETRY */
 	 level = E_ERROR;
 
+    if (!opt_udp) {
       /* tcp listen; this can fork() for us; it only returns on error or on
 	 successful establishment of tcp connection */
       result = _xioopen_listen(xfd, xioflags,
@@ -504,6 +708,17 @@ static int
 			       E_ERROR
 #endif /* WITH_RETRY */
 			       );
+    } else {
+       result = _xioopen_listen_udp(xfd, xioflags,
+                                    (struct sockaddr *)us, uslen,
+                                    opts, pf, socktype, ipproto,
+#if WITH_RETRY
+                                    (xfd->retry||xfd->forever)?E_INFO:E_ERROR
+#else
+                                    E_ERROR
+#endif /* WITH_RETRY */
+          );
+    } /* opt_udp */
 	 /*! not sure if we should try again on retry/forever */
       switch (result) {
       case STAT_OK: break;

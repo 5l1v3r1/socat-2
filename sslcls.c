@@ -319,9 +319,39 @@ X509 *sycSSL_get_peer_certificate(SSL *ssl) {
 
 int sycSSL_shutdown(SSL *ssl) {
    int result;
-   Debug1("SSL_shutdown(%p)", ssl);
-   result = SSL_shutdown(ssl);
-   Debug1("SSL_shutdown() -> %d", result);
+   /* SSL_shutdown() does not make sense for DTLS as it uses UDP */
+   SSL_METHOD *method = SSL_get_ssl_method(ssl);
+   if (false) {
+     ;
+#if HAVE_DTLS_client_method
+   } else if (method == DTLS_client_method()) {
+     return 1;
+#endif
+#if HAVE_DTLSv1_client_method
+   } else if (method == DTLSv1_client_method()) {
+     return 1;
+#endif
+#if HAVE_DTLSv1_2_client_method
+   } else if (method == DTLSv1_2_client_method()) {
+     return 1;
+#endif
+#if HAVE_DTLS_server_method
+   } else if (method == DTLS_server_method()) {
+     return 1;
+#endif
+#if HAVE_DTLSv1_server_method
+   } else if (method == DTLSv1_server_method()) {
+     return 1;
+#endif
+#if HAVE_DTLSv1_2_server_method
+   } else if (method == DTLSv1_2_server_method()) {
+     return 1;
+#endif
+   } else {
+     Debug1("SSL_shutdown(%p)", ssl);
+     result = SSL_shutdown(ssl);
+     Debug1("SSL_shutdown() -> %d", result);
+   }
    return result;
 }
 
